@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
 const { t } = useI18n();
@@ -90,6 +90,11 @@ const QUEUE_BOOT_STAGES = computed<
   }>
 >(() => [
   {
+    key: "downloading_demo",
+    label: t("live_stages.downloading_demo"),
+    meta: "required",
+  },
+  {
     key: "downloading_cs2",
     label: t("live_stages.downloading_cs2"),
     meta: "conditional",
@@ -100,11 +105,6 @@ const QUEUE_BOOT_STAGES = computed<
     meta: "required",
   },
   { key: "logging_in", label: t("live_stages.logging_in"), meta: "implicit" },
-  {
-    key: "downloading_demo",
-    label: t("live_stages.downloading_demo"),
-    meta: "required",
-  },
   {
     key: "downloading_workshop_map",
     label: t("live_stages.downloading_workshop_map"),
@@ -286,6 +286,9 @@ type BatchGroup = {
     progress: number | null;
     at: string;
     firedStages: Set<string>;
+    // First time each stage was emitted (ms epoch). Used for
+    // emit-to-emit stage durations + current-stage live elapsed.
+    stageFirstAt: Map<string, number>;
   } | null;
 };
 
@@ -340,17 +343,23 @@ function buildBatchGroup(matchMapId: string, list: Job[]): BatchGroup {
   const noneStarted = sorted.every((j) => j.status === "queued");
   if (noneStarted) {
     const firedStages = new Set<string>();
+    const stageFirstAt = new Map<string, number>();
     let latest: { entry: StatusHistoryEntry; at: number } | null = null;
     for (const j of sorted) {
       const history = j.status_history;
       if (!Array.isArray(history)) continue;
       for (const e of history) {
         if (e?.status !== "booting") continue;
+        const t = Date.parse(e.at);
         // boot_stage is "downloading_cs2:Validating" — strip sub-stage.
         if (typeof e.boot_stage === "string" && e.boot_stage) {
-          firedStages.add(e.boot_stage.split(":")[0]);
+          const key = e.boot_stage.split(":")[0];
+          firedStages.add(key);
+          if (Number.isFinite(t)) {
+            const prev = stageFirstAt.get(key);
+            if (prev === undefined || t < prev) stageFirstAt.set(key, t);
+          }
         }
-        const t = Date.parse(e.at);
         if (!Number.isFinite(t)) continue;
         if (!latest || t > latest.at) latest = { entry: e, at: t };
       }
@@ -367,6 +376,7 @@ function buildBatchGroup(matchMapId: string, list: Job[]): BatchGroup {
             : null,
         at: latest.entry.at,
         firedStages,
+        stageFirstAt,
       };
     }
   }
@@ -404,6 +414,51 @@ function stageStateFor(
     return stage.meta === "conditional" ? "skipped" : "done";
   }
   return "pending";
+}
+
+// Drives the live "12s" ticker on the current boot stage.
+const now = ref(Date.now());
+let nowTicker: ReturnType<typeof setInterval> | null = null;
+onMounted(() => {
+  nowTicker = setInterval(() => {
+    now.value = Date.now();
+  }, 1000);
+});
+onBeforeUnmount(() => {
+  if (nowTicker) clearInterval(nowTicker);
+  nowTicker = null;
+});
+
+function formatStageElapsed(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}m ${s.toString().padStart(2, "0")}s`;
+}
+
+// Emit-to-emit wall time between this stage's first tick and the
+// next fired stage's first tick (in QUEUE_BOOT_STAGES order).
+function stageDuration(group: BatchGroup, stageKey: string): string {
+  if (!group.bootInfo) return "";
+  const start = group.bootInfo.stageFirstAt.get(stageKey);
+  if (start === undefined) return "";
+  const order = QUEUE_BOOT_STAGES.value;
+  const idx = order.findIndex((s) => s.key === stageKey);
+  if (idx < 0) return "";
+  for (let i = idx + 1; i < order.length; i++) {
+    const nextAt = group.bootInfo.stageFirstAt.get(order[i].key);
+    if (nextAt !== undefined) return formatStageElapsed(nextAt - start);
+  }
+  return "";
+}
+
+function currentStageElapsed(group: BatchGroup): string {
+  if (!group.bootInfo) return "";
+  const start = group.bootInfo.stageFirstAt.get(group.bootInfo.stage);
+  if (start === undefined) return "";
+  return formatStageElapsed(now.value - start);
 }
 
 function visibleBootStages(group: BatchGroup): typeof QUEUE_BOOT_STAGES.value {
@@ -959,6 +1014,21 @@ const totalQueued = computed(
                   class="font-mono text-[0.6rem] tabular-nums opacity-80"
                 >
                   {{ Math.round(g.bootInfo.progress * 100) }}%
+                </span>
+                <span
+                  v-if="stageStateFor(g, stage) === 'current'"
+                  class="font-mono text-[0.6rem] tabular-nums opacity-70"
+                >
+                  {{ currentStageElapsed(g) }}
+                </span>
+                <span
+                  v-else-if="
+                    stageStateFor(g, stage) === 'done' &&
+                    stageDuration(g, stage.key)
+                  "
+                  class="font-mono text-[0.6rem] tabular-nums opacity-60"
+                >
+                  {{ stageDuration(g, stage.key) }}
                 </span>
                 <span
                   v-else-if="stageStateFor(g, stage) === 'skipped'"
